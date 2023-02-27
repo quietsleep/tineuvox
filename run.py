@@ -81,7 +81,6 @@ def render_viewpoints_hyper(
     savedir=None,
     eval_psnr=False,
 ):
-
     rgbs = []
     rgbs_gt = []
     rgbs_tensor = []
@@ -203,7 +202,6 @@ def render_viewpoints(
     lpips_vgg = []
 
     for i, c2w in enumerate(tqdm(render_poses)):
-
         H, W = HW[i]
         K = Ks[i]
         rays_o, rays_d, viewdirs = tineuvox.get_rays_of_a_view(
@@ -392,7 +390,6 @@ def compute_bbox_by_cam_frustrm_hyper(args, cfg, data_class):
 def scene_rep_reconstruction(
     args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, data_dict
 ):
-
     # init
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if abs(cfg_model.world_bound_scale - 1) > 1e-9:
@@ -466,6 +463,7 @@ def scene_rep_reconstruction(
         "bg": 1 if cfg.data.white_bkgd else 0,
         "stepsize": cfg_model.stepsize,
     }
+
     # init batch rays sampler
     def gather_training_rays_hyper():
         now_device = "cpu" if cfg.data.load2gpu_on_the_fly else device
@@ -618,7 +616,6 @@ def scene_rep_reconstruction(
     global_step = -1
 
     for global_step in trange(1 + start, 1 + cfg_train.N_iters):
-
         if global_step == args.step_to_half:
             model.feature.data = model.feature.data.half()
         # progress scaling checkpoint
@@ -806,7 +803,6 @@ def scene_rep_reconstruction(
 
 
 def train(args, cfg, data_dict=None):
-
     # init
     print("train: start")
     os.makedirs(os.path.join(cfg.basedir, cfg.expname), exist_ok=True)
@@ -846,7 +842,6 @@ def train(args, cfg, data_dict=None):
 
 
 if __name__ == "__main__":
-
     # load setup
     parser = config_parser()
     args = parser.parse_args()
