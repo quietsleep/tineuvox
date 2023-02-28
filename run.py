@@ -669,6 +669,16 @@ def scene_rep_reconstruction(
         else:
             raise NotImplementedError
 
+        if model.use_occ_grid:
+            model.occ_grid.every_n_step(  # type: ignore
+                step=global_step - 1,
+                occ_eval_fn=lambda x: model.occ_eval_fn(
+                    x, render_kwargs["stepsize"] * model.voxel_size
+                ),
+                occ_thre=model.occ_thres,
+                ema_decay=model.occ_ema_decay,
+            )
+
         if cfg.data.load2gpu_on_the_fly:
             target = target.to(device)
             rays_o = rays_o.to(device)
@@ -685,6 +695,8 @@ def scene_rep_reconstruction(
             global_step=global_step,
             **render_kwargs,
         )
+        if render_result["weights"].shape[0] == 0:
+            continue
 
         # gradient descent step
         optimizer.zero_grad(set_to_none=True)
@@ -818,9 +830,12 @@ def train(args, cfg, data_dict=None):
             args=args, cfg=cfg, data_class=data_dict["data_class"]
         )
     else:
-        xyz_min, xyz_max = compute_bbox_by_cam_frustrm(
-            args=args, cfg=cfg, **data_dict
-        )
+        if data_dict is not None and "aabb" in cfg.data:
+            xyz_min, xyz_max = torch.tensor(cfg.data["aabb"]).reshape(2, 3)
+        else:
+            xyz_min, xyz_max = compute_bbox_by_cam_frustrm(
+                args=args, cfg=cfg, **data_dict
+            )
     coarse_ckpt_path = None
 
     # fine detail reconstruction
@@ -855,6 +870,7 @@ if __name__ == "__main__":
     seed_everything()
     data_dict = None
     # load images / poses / camera settings / data split
+    print("loading data...")
     data_dict = load_everything(args=args, cfg=cfg)
 
     # train
