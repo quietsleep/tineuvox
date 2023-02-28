@@ -86,6 +86,54 @@ def nerfacc_rendering(
     return colors, opacities, depths, rgbs, sigmas, weights
 
 
+#  def nerfacc_rendering(
+#      # ray marching results
+#      t_starts: torch.Tensor,
+#      t_ends: torch.Tensor,
+#      ray_indices: torch.Tensor,
+#      n_rays: int,
+#      # radiance field
+#      rgb_alpha_fn: Optional[Callable] = None,
+#      # rendering options
+#      render_bkgd: Optional[torch.Tensor] = None,
+#  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#      assert rgb_alpha_fn is not None
+
+#      rgbs, alphas = rgb_alpha_fn(t_starts, t_ends, ray_indices)
+#      assert rgbs.shape[-1] == 3, "rgbs must have 3 channels, got {}".format(
+#          rgbs.shape
+#      )
+#      assert (
+#          alphas.shape == t_starts.shape
+#      ), "alphas must have shape of (N, 1)! Got {}".format(alphas.shape)
+#      # Rendering: compute weights.
+#      weights = nerfacc.vol_rendering.render_weight_from_alpha(
+#          alphas,
+#          ray_indices=ray_indices,
+#          n_rays=n_rays,
+#      )
+
+#      # Rendering: accumulate rgbs, opacities, and depths along the rays.
+#      colors = nerfacc.vol_rendering.accumulate_along_rays(
+#          weights, ray_indices, values=rgbs, n_rays=n_rays
+#      )
+#      opacities = nerfacc.vol_rendering.accumulate_along_rays(
+#          weights, ray_indices, values=None, n_rays=n_rays
+#      )
+#      depths = nerfacc.vol_rendering.accumulate_along_rays(
+#          weights,
+#          ray_indices,
+#          values=(t_starts + t_ends) / 2.0,
+#          n_rays=n_rays,
+#      )
+
+#      # Background composition.
+#      if render_bkgd is not None:
+#          colors = colors + render_bkgd * (1.0 - opacities)
+
+#      return colors, opacities, depths, rgbs, alphas, weights
+
+
 class Deformation(nn.Module):
     def __init__(
         self,
@@ -230,9 +278,9 @@ class TiNeuVox(torch.nn.Module):
                 resolution=self.occ_grid_reso,
             )
 
-            def occ_eval_fn(x, stepsize):
+            def occ_eval_fn(x, step_size):
                 density = self.query_density(x, torch.rand_like(x[:, :1]))
-                return density * stepsize
+                return density * step_size
 
             self.occ_eval_fn = occ_eval_fn
 
@@ -512,7 +560,7 @@ class TiNeuVox(torch.nn.Module):
         )
         density_result = self.densitynet(h_feature)
 
-        alpha = nn.Softplus()(density_result + self.act_shift)
+        alpha = nn.Softplus()(density_result + self.act_shift) * 25
         return alpha
 
     def query_rgb_density(self, ray_pts, viewdirs, times_sel, cam_sel):
@@ -533,7 +581,7 @@ class TiNeuVox(torch.nn.Module):
         )
         density_result = self.densitynet(h_feature)
 
-        alpha = nn.Softplus()(density_result + self.act_shift)
+        alpha = nn.Softplus()(density_result + self.act_shift) * 25
 
         viewdirs_emb = poc_fre(viewdirs, self.view_poc)
         if self.add_cam == True:
@@ -569,12 +617,13 @@ class TiNeuVox(torch.nn.Module):
         N = len(rays_o)
 
         if self.use_occ_grid:
+            rays_d_normed = F.normalize(rays_d, dim=-1)
 
             def sigma_fn(t_starts, t_ends, ray_indices):
                 if ray_indices.shape[0] == 0:
                     return torch.zeros((0, 1), device=ray_indices.device)
                 t_origins = rays_o[ray_indices]
-                t_dirs = rays_d[ray_indices]
+                t_dirs = rays_d_normed[ray_indices]
                 t_times = times_sel[ray_indices]
                 positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
                 return self.query_density(positions, t_times)
@@ -585,7 +634,7 @@ class TiNeuVox(torch.nn.Module):
                         (0, 3), device=ray_indices.device
                     ), torch.zeros((0, 1), device=ray_indices.device)
                 t_origins = rays_o[ray_indices]
-                t_dirs = rays_d[ray_indices]
+                t_dirs = rays_d_normed[ray_indices]
                 t_views = viewdirs[ray_indices]
                 t_times = times_sel[ray_indices]
                 t_cams = None
@@ -599,7 +648,7 @@ class TiNeuVox(torch.nn.Module):
 
             ray_indices, t_starts, t_ends = nerfacc.ray_marching(
                 rays_o,
-                rays_d,
+                rays_d_normed,
                 scene_aabb=self.occ_grid.roi_aabb,  # type: ignore
                 grid=self.occ_grid,
                 sigma_fn=sigma_fn,
@@ -624,17 +673,15 @@ class TiNeuVox(torch.nn.Module):
                 rgb_sigma_fn=rgb_sigma_fn,
                 render_bkgd=render_kwargs["bg"],
             )
-            #  occ_perc = model.occ_grid.binary.float().mean().item()
-            #  print(f"global_step = {global_step}, occ_perc = {occ_perc}")
+
+            #  occ_perc = self.occ_grid.binary.float().mean().item()
             #  samples_per_ray = (
             #      torch.unique(ray_indices, return_counts=True)[1]
             #      .float()
             #      .mean()
             #      .item()
             #  )
-            #  print(
-            #      f"occ_perc = {occ_perc}, num_samples = {samples_per_ray}"
-            #  )
+            #  print(f"occ_perc={occ_perc}, num_samples={samples_per_ray}")
 
             # TODO(Hang Gao @ 02/27): Figure out what are these.
             ret_dict.update(
@@ -648,6 +695,20 @@ class TiNeuVox(torch.nn.Module):
                     "depth": depth[:, 0],  # [N]
                 }
             )
+
+            # computer bg_points_delta
+            if bg_points_sel is not None:
+                times_feature = self.timenet(
+                    poc_fre(
+                        torch.rand_like(bg_points_sel[:, :1]), self.time_poc
+                    )
+                )
+                bg_points_sel_emb = poc_fre(bg_points_sel, self.pos_poc)
+                bg_points_sel_delta = self.deformation_net(
+                    bg_points_sel_emb,
+                    times_feature,
+                )
+                ret_dict.update({"bg_points_delta": bg_points_sel_delta})
         else:
             times_emb = poc_fre(times_sel, self.time_poc)
             viewdirs_emb = poc_fre(viewdirs, self.view_poc)

@@ -93,12 +93,12 @@ def render_viewpoints_hyper(
         if all:
             idx = data_class.i_test
         else:
-            idx = data_class.i_test[::16]
+            idx = data_class.i_test[::100]
     else:
         if all:
             idx = data_class.i_train
         else:
-            idx = data_class.i_train[::16]
+            idx = data_class.i_train[::100]
     for i in tqdm(idx):
         rays_o, rays_d, viewdirs, rgb_gt = data_class.load_idx(i, not_dic=True)
         keys = ["rgb_marched", "depth"]
@@ -371,7 +371,7 @@ def compute_bbox_by_cam_frustrm_hyper(args, cfg, data_class):
     print("compute_bbox_by_cam_frustrm: start")
     xyz_min = torch.Tensor([np.inf, np.inf, np.inf])
     xyz_max = -xyz_min
-    for i in data_class.i_train:
+    for i in tqdm(data_class.i_train, desc="Computing bbox"):
         rays_o, _, viewdirs, _ = data_class.load_idx(i, not_dic=True)
         pts_nf = torch.stack(
             [
@@ -476,7 +476,7 @@ def scene_rep_reconstruction(
         cam_tr = torch.ones([N, 1], device=now_device)
         imsz = []
         top = 0
-        for i in data_class.i_train:
+        for i in tqdm(data_class.i_train, desc="Load training"):
             rays_o, rays_d, viewdirs, rgb = data_class.load_idx(
                 i, not_dic=True
             )
@@ -615,7 +615,8 @@ def scene_rep_reconstruction(
     time0 = time.time()
     global_step = -1
 
-    for global_step in trange(1 + start, 1 + cfg_train.N_iters):
+    pbar = trange(1 + start, 1 + cfg_train.N_iters)
+    for global_step in pbar:
         if global_step == args.step_to_half:
             model.feature.data = model.feature.data.half()
         # progress scaling checkpoint
@@ -707,9 +708,10 @@ def scene_rep_reconstruction(
 
         if cfg.data.dataset_type == "hyper_dataset":
             if data_class.use_bg_points == True:
-                loss = loss + F.mse_loss(
+                bg_loss = F.mse_loss(
                     render_result["bg_points_delta"], bg_points_sel
                 )
+                loss = loss + bg_loss
         if cfg_train.weight_entropy_last > 0:
             pout = render_result["alphainv_last"].clamp(1e-6, 1 - 1e-6)
             entropy_last_loss = -(
@@ -727,6 +729,14 @@ def scene_rep_reconstruction(
             ).sum() / len(rays_o)
             loss += cfg_train.weight_rgbper * rgbper_loss
         loss.backward()
+
+        pbar.set_description(
+            f"loss: {loss.item():.4f}, "
+            #  f"bg_loss: {bg_loss.item():.4f}, "
+            #  f"entropy_last_loss: {entropy_last_loss.item():.4f}, "
+            #  f"rgbper_loss: {rgbper_loss.item():.4f}, "
+            f"PSNR: {psnr.item():.2f}"
+        )
 
         if (
             global_step < cfg_train.tv_before
@@ -752,7 +762,11 @@ def scene_rep_reconstruction(
             eps_time_str = f"{eps_time//3600:02.0f}:{eps_time//60%60:02.0f}:{eps_time%60:02.0f}"
             tqdm.write(
                 f"scene_rep_reconstruction : iter {global_step:6d} / "
-                f"Loss: {loss.item():.9f} / PSNR: {np.mean(psnr_lst):5.2f} / "
+                f"Loss: {loss.item():.9f} / "
+                f"BG Loss: {bg_loss.item():.9f} / "
+                f"Ent Loss: {entropy_last_loss.item():.9f} / "
+                f"RGB-Per Loss: {rgbper_loss.item():.9f} / "
+                f"PSNR: {np.mean(psnr_lst):5.2f} / "
                 f"Eps: {eps_time_str}"
             )
             psnr_lst = []
@@ -795,7 +809,8 @@ def scene_rep_reconstruction(
                     data_class=data_class,
                     savedir=testsavedir,
                     all=False,
-                    test=True,
+                    #  test=True,
+                    test=False,
                     eval_psnr=args.eval_psnr,
                     **render_viewpoints_kwargs,
                 )
@@ -826,9 +841,12 @@ def train(args, cfg, data_dict=None):
 
     # coarse geometry searching
     if cfg.data.dataset_type == "hyper_dataset":
-        xyz_min, xyz_max = compute_bbox_by_cam_frustrm_hyper(
-            args=args, cfg=cfg, data_class=data_dict["data_class"]
-        )
+        if data_dict is not None and "aabb" in cfg.data:
+            xyz_min, xyz_max = torch.tensor(cfg.data["aabb"]).reshape(2, 3)
+        else:
+            xyz_min, xyz_max = compute_bbox_by_cam_frustrm_hyper(
+                args=args, cfg=cfg, data_class=data_dict["data_class"]
+            )
     else:
         if data_dict is not None and "aabb" in cfg.data:
             xyz_min, xyz_max = torch.tensor(cfg.data["aabb"]).reshape(2, 3)
