@@ -1,6 +1,6 @@
 _base_ = "./hyper_default.py"
 
-expname = "vrig/base-3dprinter_2dbgg"
+expname = "vrig/base-3dprinter_2"
 basedir = "./logs/vrig_data"
 
 model_and_render = dict(

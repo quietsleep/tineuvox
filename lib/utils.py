@@ -500,6 +500,42 @@ def create_optimizer_or_freeze_model(model, cfg_train, global_step):
         else:
             print(f"create_optimizer_or_freeze_model: param {k} freeze")
             param.requires_grad = False
+    if model.use_prop:
+        for k in cfg_train.keys():
+            if not k.startswith("lrate_"):
+                continue
+            k = k[len("lrate_") :]
+            for module in model.props:
+                if not hasattr(module, k):
+                    continue
+                param = getattr(module, k)
+                if param is None:
+                    print(
+                        f"create_optimizer_or_freeze_model: param {k} not exist"
+                    )
+                    continue
+
+                lr = getattr(cfg_train, f"lrate_{k}") * decay_factor
+                if lr > 0:
+                    print(
+                        f"create_optimizer_or_freeze_model: param {k} lr {lr}"
+                    )
+                    if isinstance(param, nn.Module):
+                        param = param.parameters()
+                    param_group.append(
+                        {
+                            "params": param,
+                            "lr": lr,
+                            "skip_zero_grad": (
+                                k in cfg_train.skip_zero_grad_fields
+                            ),
+                        }
+                    )
+                else:
+                    print(
+                        f"create_optimizer_or_freeze_model: param {k} freeze"
+                    )
+                    param.requires_grad = False
     return MaskedAdam(param_group)
 
 

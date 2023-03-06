@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 from torch_scatter import segment_coo
 
+from lib.prop_utils import rendering as prop_rendering
+
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 render_utils_cuda = load(
     name="render_utils_cuda",
@@ -84,54 +86,6 @@ def nerfacc_rendering(
         colors = colors + render_bkgd * (1.0 - opacities)
 
     return colors, opacities, depths, rgbs, sigmas, weights
-
-
-#  def nerfacc_rendering(
-#      # ray marching results
-#      t_starts: torch.Tensor,
-#      t_ends: torch.Tensor,
-#      ray_indices: torch.Tensor,
-#      n_rays: int,
-#      # radiance field
-#      rgb_alpha_fn: Optional[Callable] = None,
-#      # rendering options
-#      render_bkgd: Optional[torch.Tensor] = None,
-#  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#      assert rgb_alpha_fn is not None
-
-#      rgbs, alphas = rgb_alpha_fn(t_starts, t_ends, ray_indices)
-#      assert rgbs.shape[-1] == 3, "rgbs must have 3 channels, got {}".format(
-#          rgbs.shape
-#      )
-#      assert (
-#          alphas.shape == t_starts.shape
-#      ), "alphas must have shape of (N, 1)! Got {}".format(alphas.shape)
-#      # Rendering: compute weights.
-#      weights = nerfacc.vol_rendering.render_weight_from_alpha(
-#          alphas,
-#          ray_indices=ray_indices,
-#          n_rays=n_rays,
-#      )
-
-#      # Rendering: accumulate rgbs, opacities, and depths along the rays.
-#      colors = nerfacc.vol_rendering.accumulate_along_rays(
-#          weights, ray_indices, values=rgbs, n_rays=n_rays
-#      )
-#      opacities = nerfacc.vol_rendering.accumulate_along_rays(
-#          weights, ray_indices, values=None, n_rays=n_rays
-#      )
-#      depths = nerfacc.vol_rendering.accumulate_along_rays(
-#          weights,
-#          ray_indices,
-#          values=(t_starts + t_ends) / 2.0,
-#          n_rays=n_rays,
-#      )
-
-#      # Background composition.
-#      if render_bkgd is not None:
-#          colors = colors + render_bkgd * (1.0 - opacities)
-
-#      return colors, opacities, depths, rgbs, alphas, weights
 
 
 class Deformation(nn.Module):
@@ -238,6 +192,15 @@ class TiNeuVox(torch.nn.Module):
         occ_alpha_thres=0.0,
         occ_thres=0.01,
         occ_ema_decay=0.95,
+        voxel_factor_per_prop=None,
+        voxel_dim_factor_per_prop=None,
+        defor_depth_factor_per_prop=None,
+        net_width_factor_per_prop=None,
+        num_samples_per_prop=None,
+        num_samples=None,
+        opaque_bkgd=True,
+        #  opaque_bkgd=False,
+        sampling_type="uniform",
         **kwargs,
     ):
         super(TiNeuVox, self).__init__()
@@ -364,6 +327,77 @@ class TiNeuVox(torch.nn.Module):
         print("TiNeuVox: featurenet mlp", self.featurenet)
         print("TiNeuVox: rgbnet mlp", self.rgbnet)
 
+        self.use_prop = voxel_dim_factor_per_prop is not None
+        self.voxel_factor_per_prop = voxel_factor_per_prop
+        self.voxel_dim_factor_per_prop = voxel_dim_factor_per_prop
+        self.defor_depth_factor_per_prop = defor_depth_factor_per_prop
+        self.net_width_factor_per_prop = net_width_factor_per_prop
+        self.num_samples_per_prop = num_samples_per_prop
+        self.num_samples = num_samples
+        self.opaque_bkgd = opaque_bkgd
+        self.sampling_type = sampling_type
+        if self.use_prop:
+            assert not self.use_occ_grid
+            assert (
+                len(self.voxel_factor_per_prop)
+                == len(self.voxel_dim_factor_per_prop)
+                and len(self.voxel_factor_per_prop)
+                == len(self.defor_depth_factor_per_prop)
+                and len(self.voxel_factor_per_prop)
+                == len(self.net_width_factor_per_prop)
+                and len(self.voxel_factor_per_prop)
+                == len(self.num_samples_per_prop)
+            )
+            self.num_voxels_per_prop = [
+                int(self.num_voxels / f) for f in self.voxel_factor_per_prop  # type: ignore
+            ]
+            self.num_voxels_base_per_prop = [
+                int(self.num_voxels_base / f)
+                for f in self.voxel_factor_per_prop  # type: ignore
+            ]
+            self.voxel_dim_per_prop = [
+                int(self.voxel_dim / f) for f in self.voxel_factor_per_prop  # type: ignore
+            ]
+            self.defor_depth_per_prop = [
+                int(self.defor_depth / f)
+                for f in self.defor_depth_factor_per_prop  # type: ignore
+            ]
+            self.net_width_per_prop = [
+                int(self.net_width / f) for f in self.net_width_factor_per_prop  # type: ignore
+            ]
+            self.props = nn.ModuleList(
+                [
+                    DensityTiNeuVox(
+                        xyz_min,
+                        xyz_max,
+                        _num_voxels,
+                        _num_voxels_base,
+                        alpha_init,
+                        fast_color_thres,
+                        _voxel_dim,
+                        _defor_depth,
+                        _net_width,
+                        posbase_pe,
+                        timebase_pe,
+                        gridbase_pe,
+                        **kwargs,
+                    )
+                    for (
+                        _num_voxels,
+                        _num_voxels_base,
+                        _voxel_dim,
+                        _defor_depth,
+                        _net_width,
+                    ) in zip(
+                        self.num_voxels_per_prop,
+                        self.num_voxels_base_per_prop,
+                        self.voxel_dim_per_prop,
+                        self.defor_depth_per_prop,
+                        self.net_width_per_prop,
+                    )
+                ]
+            )
+
     def _set_grid_resolution(self, num_voxels):
         # Determine grid resolution
         self.num_voxels = num_voxels
@@ -401,6 +435,14 @@ class TiNeuVox(torch.nn.Module):
             "occ_alpha_thres": self.occ_alpha_thres,
             "occ_thres": self.occ_thres,
             "occ_ema_decay": self.occ_ema_decay,
+            "voxel_factor_per_prop": self.voxel_factor_per_prop,
+            "voxel_dim_factor_per_prop": self.voxel_dim_factor_per_prop,
+            "defor_depth_factor_per_prop": self.defor_depth_factor_per_prop,
+            "net_width_factor_per_prop": self.net_width_factor_per_prop,
+            "num_samples_per_prop": self.num_samples_per_prop,
+            "num_samples": self.num_samples,
+            "opaque_bkgd": self.opaque_bkgd,
+            "sampling_type": self.sampling_type,
         }
 
     @torch.no_grad()
@@ -422,6 +464,11 @@ class TiNeuVox(torch.nn.Module):
                 align_corners=True,
             )
         )
+
+        for i, prop in enumerate(getattr(self, "props", [])):
+            prop.scale_volume_grid(
+                int(num_voxels / self.voxel_factor_per_prop[i])
+            )
 
     def feature_total_variation_add_grad(self, weight, dense_mode):
         weight = weight * self.world_size.max() / 128
@@ -602,6 +649,7 @@ class TiNeuVox(torch.nn.Module):
         cam_sel=None,
         bg_points_sel=None,
         global_step=None,
+        prop_requires_grad=False,
         **render_kwargs,
     ):
         """Volume rendering
@@ -693,6 +741,109 @@ class TiNeuVox(torch.nn.Module):
                     "raw_rgb": rgb,  # [S, 3]
                     "ray_id": ray_indices,  # [S]
                     "depth": depth[:, 0],  # [N]
+                }
+            )
+
+            # computer bg_points_delta
+            if bg_points_sel is not None:
+                times_feature = self.timenet(
+                    poc_fre(
+                        torch.rand_like(bg_points_sel[:, :1]), self.time_poc
+                    )
+                )
+                bg_points_sel_emb = poc_fre(bg_points_sel, self.pos_poc)
+                bg_points_sel_delta = self.deformation_net(
+                    bg_points_sel_emb,
+                    times_feature,
+                )
+                ret_dict.update({"bg_points_delta": bg_points_sel_delta})
+        elif self.use_prop:
+            rays_d_normed = F.normalize(rays_d, dim=-1)
+
+            def prop_sigma_fn(t_starts, t_ends, prop_i):
+                t_origins = rays_o[..., None, :]
+                t_dirs = rays_d_normed[..., None, :]
+                t_times = times_sel[..., None, :].repeat_interleave(
+                    t_starts.shape[-2], dim=-2
+                )
+                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+                return self.props[prop_i](
+                    positions.reshape(-1, 3), t_times.reshape(-1, 1)
+                ).reshape(*t_starts.shape[:-1], 1)
+
+            def rgb_sigma_fn(t_starts, t_ends):
+                t_origins = rays_o[..., None, :]
+                t_dirs = rays_d_normed[..., None, :].repeat_interleave(
+                    t_starts.shape[-2], dim=-2
+                )
+                t_views = viewdirs[..., None, :].repeat_interleave(
+                    t_starts.shape[-2], dim=-2
+                )
+                t_times = times_sel[..., None, :].repeat_interleave(
+                    t_starts.shape[-2], dim=-2
+                )
+                t_cams = None
+                if self.add_cam:
+                    assert cam_sel is not None
+                    t_cams = cam_sel[..., None, :].repeat_interleave(
+                        t_starts.shape[-2], dim=-2
+                    )
+                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+                rgbs, sigmas = self.query_rgb_density(
+                    positions.reshape(-1, 3),
+                    t_views.reshape(-1, 3),
+                    t_times.reshape(-1, 1),
+                    None if not self.add_cam else t_cams.reshape(-1, 1),
+                )
+                rgbs = rgbs.reshape(*t_starts.shape[:-1], 3)
+                sigmas = sigmas.reshape(*t_starts.shape[:-1], 1)
+                return rgbs, sigmas
+
+            (
+                rgb_marched,
+                opacity,
+                depth,
+                rgb,
+                alpha,
+                weights,
+                (weights_per_level, s_vals_per_level),
+            ) = prop_rendering(
+                rgb_sigma_fn=rgb_sigma_fn,
+                num_samples=self.num_samples,
+                prop_sigma_fns=[
+                    lambda *args: prop_sigma_fn(*args, i)
+                    for i in range(len(self.num_samples_per_prop))
+                ],
+                num_samples_per_prop=self.num_samples_per_prop,
+                rays_o=rays_o,
+                rays_d=rays_d_normed,
+                scene_aabb=None,
+                near_plane=render_kwargs["near"],
+                far_plane=render_kwargs["far"],
+                stratified=self.training,
+                sampling_type=self.sampling_type,
+                opaque_bkgd=self.opaque_bkgd,
+                render_bkgd=render_kwargs["bg"],
+                proposal_requires_grad=prop_requires_grad,
+            )
+
+            ret_dict.update(
+                {
+                    "alphainv_last": 1 - opacity[:, 0],  # [N]
+                    "weights": weights.reshape(-1),  # [S]
+                    "rgb_marched": rgb_marched,  # [N, 3]
+                    "raw_alpha": alpha.reshape(-1),  # [S]
+                    "raw_rgb": rgb.reshape(-1, 3),  # [S, 3]
+                    "ray_id": torch.arange(
+                        len(rgb_marched),
+                        dtype=torch.int64,
+                        device=rgb_marched.device,
+                    )[:, None]
+                    .repeat_interleave(self.num_samples, dim=1)
+                    .reshape(-1),  # [S]
+                    "depth": depth[:, 0],  # [N]
+                    "weights_per_level": weights_per_level,
+                    "s_vals_per_level": s_vals_per_level,
                 }
             )
 
@@ -806,6 +957,215 @@ class TiNeuVox(torch.nn.Module):
                 )
             ret_dict.update({"depth": depth})
         return ret_dict
+
+
+class DensityTiNeuVox(torch.nn.Module):
+    def __init__(
+        self,
+        xyz_min,
+        xyz_max,
+        num_voxels=0,
+        num_voxels_base=0,
+        alpha_init=None,
+        fast_color_thres=0,
+        voxel_dim=0,
+        defor_depth=3,
+        net_width=128,
+        posbase_pe=10,
+        timebase_pe=8,
+        gridbase_pe=2,
+        **kwargs,
+    ):
+        super(DensityTiNeuVox, self).__init__()
+        self.voxel_dim = voxel_dim
+        self.defor_depth = defor_depth
+        self.net_width = net_width
+        self.posbase_pe = posbase_pe
+        self.timebase_pe = timebase_pe
+        self.gridbase_pe = gridbase_pe
+        times_ch = 2 * timebase_pe + 1
+        self.register_buffer("xyz_min", torch.Tensor(xyz_min))
+        self.register_buffer("xyz_max", torch.Tensor(xyz_max))
+        self.fast_color_thres = fast_color_thres
+        # determine based grid resolution
+        self.num_voxels_base = num_voxels_base
+        self.voxel_size_base = (
+            (self.xyz_max - self.xyz_min).prod() / self.num_voxels_base
+        ).pow(1 / 3)
+
+        # determine the density bias shift
+        self.alpha_init = alpha_init
+        self.act_shift = np.log(1 / (1 - alpha_init) - 1)
+        print("DensityTiNeuVox: set density bias shift to", self.act_shift)
+
+        timenet_width = net_width
+        timenet_depth = 1
+        timenet_output = voxel_dim + voxel_dim * 2 * gridbase_pe
+        self.timenet = nn.Sequential(
+            nn.Linear(times_ch, timenet_width),
+            nn.ReLU(inplace=True),
+            nn.Linear(timenet_width, timenet_output),
+        )
+
+        featurenet_width = net_width
+        featurenet_depth = 1
+        grid_dim = voxel_dim * 3 + voxel_dim * 3 * 2 * gridbase_pe
+        input_dim = grid_dim + timenet_output + 0 + 0 + 3 + 3 * posbase_pe * 2
+        self.featurenet = nn.Sequential(
+            nn.Linear(input_dim, featurenet_width),
+            nn.ReLU(inplace=True),
+            *[
+                nn.Sequential(
+                    nn.Linear(featurenet_width, featurenet_width),
+                    nn.ReLU(inplace=True),
+                )
+                for _ in range(featurenet_depth - 1)
+            ],
+        )
+        self.featurenet_width = featurenet_width
+        self._set_grid_resolution(num_voxels)
+        self.deformation_net = Deformation(
+            W=net_width,
+            D=defor_depth,
+            input_ch=3 + 3 * posbase_pe * 2,
+            input_ch_time=timenet_output,
+        )
+        input_dim = featurenet_width
+        self.densitynet = nn.Linear(input_dim, 1)
+
+        self.register_buffer(
+            "time_poc",
+            torch.FloatTensor([(2**i) for i in range(timebase_pe)]),
+        )
+        self.register_buffer(
+            "grid_poc",
+            torch.FloatTensor([(2**i) for i in range(gridbase_pe)]),
+        )
+        self.register_buffer(
+            "pos_poc", torch.FloatTensor([(2**i) for i in range(posbase_pe)])
+        )
+
+        self.voxel_dim = voxel_dim
+        self.feature = torch.nn.Parameter(
+            torch.zeros(
+                [1, self.voxel_dim, *self.world_size], dtype=torch.float32
+            )
+        )
+
+        print("DensityTiNeuVox: feature voxel grid", self.feature.shape)
+        print("DensityTiNeuVox: timenet mlp", self.timenet)
+        print("DensityTiNeuVox: deformation_net mlp", self.deformation_net)
+        print("DensityTiNeuVox: densitynet mlp", self.densitynet)
+        print("DensityTiNeuVox: featurenet mlp", self.featurenet)
+
+    def _set_grid_resolution(self, num_voxels):
+        # Determine grid resolution
+        self.num_voxels = num_voxels
+        self.voxel_size = (
+            (self.xyz_max - self.xyz_min).prod() / num_voxels
+        ).pow(1 / 3)
+        self.world_size = (
+            (self.xyz_max - self.xyz_min) / self.voxel_size
+        ).long()
+        self.voxel_size_ratio = self.voxel_size / self.voxel_size_base
+        print("DensityTiNeuVox: voxel_size      ", self.voxel_size)
+        print("DensityTiNeuVox: world_size      ", self.world_size)
+        print("DensityTiNeuVox: voxel_size_base ", self.voxel_size_base)
+        print("DensityTiNeuVox: voxel_size_ratio", self.voxel_size_ratio)
+
+    @torch.no_grad()
+    def scale_volume_grid(self, num_voxels):
+        print("DensityTiNeuVox: scale_volume_grid start")
+        ori_world_size = self.world_size
+        self._set_grid_resolution(num_voxels)
+        print(
+            "DensityTiNeuVox: scale_volume_grid scale world_size from",
+            ori_world_size,
+            "to",
+            self.world_size,
+        )
+        self.feature = torch.nn.Parameter(
+            F.interpolate(
+                self.feature.data,
+                size=tuple(self.world_size),
+                mode="trilinear",
+                align_corners=True,
+            )
+        )
+
+    def grid_sampler(self, xyz, *grids, mode=None, align_corners=True):
+        """Wrapper for the interp operation"""
+        mode = "bilinear"
+        shape = xyz.shape[:-1]
+        xyz = xyz.reshape(1, 1, 1, -1, 3)
+        ind_norm = ((xyz - self.xyz_min) / (self.xyz_max - self.xyz_min)).flip(
+            (-1,)
+        ) * 2 - 1
+        ret_lst = [
+            F.grid_sample(
+                grid, ind_norm, mode=mode, align_corners=align_corners
+            )
+            .reshape(grid.shape[1], -1)
+            .T.reshape(*shape, grid.shape[1])
+            for grid in grids
+        ]
+        for i in range(len(grids)):
+            if ret_lst[i].shape[-1] == 1:
+                ret_lst[i] = ret_lst[i].squeeze(-1)
+        if len(ret_lst) == 1:
+            return ret_lst[0]
+        return ret_lst
+
+    def mult_dist_interp(self, ray_pts_delta):
+        x_pad = (
+            math.ceil((self.feature.shape[2] - 1) / 4.0) * 4
+            - self.feature.shape[2]
+            + 1
+        )
+        y_pad = (
+            math.ceil((self.feature.shape[3] - 1) / 4.0) * 4
+            - self.feature.shape[3]
+            + 1
+        )
+        z_pad = (
+            math.ceil((self.feature.shape[4] - 1) / 4.0) * 4
+            - self.feature.shape[4]
+            + 1
+        )
+        grid = F.pad(self.feature.float(), (0, z_pad, 0, y_pad, 0, x_pad))
+        # three
+        vox_l = self.grid_sampler(ray_pts_delta, grid)
+        vox_m = self.grid_sampler(ray_pts_delta, grid[:, :, ::2, ::2, ::2])
+        vox_s = self.grid_sampler(ray_pts_delta, grid[:, :, ::4, ::4, ::4])
+        vox_feature = torch.cat((vox_l, vox_m, vox_s), -1)
+
+        if len(vox_feature.shape) == 1:
+            vox_feature_flatten = vox_feature.unsqueeze(0)
+        else:
+            vox_feature_flatten = vox_feature
+
+        return vox_feature_flatten
+
+    def forward(self, ray_pts, times_sel):
+        times_emb = poc_fre(times_sel, self.time_poc)
+        times_feature = self.timenet(times_emb)
+
+        # pts deformation
+        rays_pts_emb = poc_fre(ray_pts, self.pos_poc)
+        ray_pts_delta = self.deformation_net(rays_pts_emb, times_feature)
+        # voxel query interp
+        vox_feature_flatten = self.mult_dist_interp(ray_pts_delta)
+
+        vox_feature_flatten_emb = poc_fre(vox_feature_flatten, self.grid_poc)
+        h_feature = self.featurenet(
+            torch.cat(
+                (vox_feature_flatten_emb, rays_pts_emb, times_feature), -1
+            )
+        )
+        density_result = self.densitynet(h_feature)
+
+        alpha = nn.Softplus()(density_result + self.act_shift) * 25
+        return alpha
 
 
 class Alphas2Weights(torch.autograd.Function):

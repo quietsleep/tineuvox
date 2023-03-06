@@ -16,6 +16,7 @@ from tqdm import tqdm, trange
 
 from lib import tineuvox, utils
 from lib.load_data import load_data
+from lib.prop_utils import compute_prop_loss, get_proposal_requires_grad_fn
 
 
 def config_parser():
@@ -614,6 +615,7 @@ def scene_rep_reconstruction(
     psnr_lst = []
     time0 = time.time()
     global_step = -1
+    proposal_requires_grad_fn = get_proposal_requires_grad_fn()
 
     pbar = trange(1 + start, 1 + cfg_train.N_iters)
     for global_step in pbar:
@@ -694,6 +696,7 @@ def scene_rep_reconstruction(
             viewdirs,
             times_sel,
             global_step=global_step,
+            prop_requires_grad=proposal_requires_grad_fn(global_step),
             **render_kwargs,
         )
         if render_result["weights"].shape[0] == 0:
@@ -728,6 +731,12 @@ def scene_rep_reconstruction(
                 rgbper * render_result["weights"].detach()
             ).sum() / len(rays_o)
             loss += cfg_train.weight_rgbper * rgbper_loss
+        if model.use_prop:
+            prop_loss = compute_prop_loss(
+                render_result["s_vals_per_level"],
+                render_result["weights_per_level"],
+            )
+            loss += prop_loss
         loss.backward()
 
         pbar.set_description(
@@ -760,7 +769,7 @@ def scene_rep_reconstruction(
         if global_step % args.i_print == 0:
             eps_time = time.time() - time0
             eps_time_str = f"{eps_time//3600:02.0f}:{eps_time//60%60:02.0f}:{eps_time%60:02.0f}"
-            tqdm.write(
+            log_str = (
                 f"scene_rep_reconstruction : iter {global_step:6d} / "
                 f"Loss: {loss.item():.9f} / "
                 f"BG Loss: {bg_loss.item():.9f} / "
@@ -769,6 +778,9 @@ def scene_rep_reconstruction(
                 f"PSNR: {np.mean(psnr_lst):5.2f} / "
                 f"Eps: {eps_time_str}"
             )
+            if model.use_prop:
+                log_str += f" / Prop Loss: {prop_loss.item():.9f}"
+            tqdm.write(log_str)
             psnr_lst = []
 
         if global_step % (args.fre_test) == 0:
@@ -943,7 +955,7 @@ if __name__ == "__main__":
             )
         elif cfg.data.dataset_type == "hyper_dataset":
             rgbs, disps = render_viewpoints_hyper(
-                data_calss=data_dict["data_calss"],
+                data_class=data_dict["data_class"],
                 savedir=testsavedir,
                 all=True,
                 test=False,
