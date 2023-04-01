@@ -47,6 +47,9 @@ The dataset provided in [HyperNeRF](https://github.com/google/hypernerf) is used
 For training synthetic scenes such as `standup`, run 
 ``` 
 python run.py --config configs/nerf-*/standup.py 
+
+# optionally use nerfacc (occ grid) to speedup
+python run.py --config configs/nerf-*-nerfacc-occgrid/standup.py
 ``` 
 Use `small` for TiNeuVox-S and `base` for TiNeuVox-B.
 Use `--render_video` to render a video.
@@ -54,6 +57,10 @@ Use `--render_video` to render a video.
 For training real scenes such as `vrig_chicken`, run 
 ``` 
 python run.py --config configs/vrig_dataset/chicken.py  
+
+# optionally use nerfacc (occ grid or prop net) to speedup
+python run.py --config configs/vrig_chicken-nerfacc-occgrid/chicken.py
+python run.py --config configs/vrig_chicken-nerfacc-propnet/chicken.py
 ``` 
 
 ## Evaluation

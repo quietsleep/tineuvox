@@ -7,6 +7,7 @@ imageio
 imageio-ffmpeg
 opencv-python
 pytorch_msssim
-torch==1.13.1
+torch
 torch_scatter
 Pillow
+nerfacc==0.5.0
