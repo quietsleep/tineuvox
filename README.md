@@ -27,6 +27,7 @@ We propose a radiance field framework by representing scenes with time-aware vox
 * pytorch_msssim
 * torch
 * torch_scatter
+* nerfacc
 
 ## Data Preparation
 **For synthetic scenes:**  
