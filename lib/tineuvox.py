@@ -363,6 +363,9 @@ class TiNeuVox(torch.nn.Module):
         
         return vox_feature_flatten
 
+    def activate_density(self, density, interval=None): 
+        interval = interval if interval is not None else self.voxel_size_ratio 
+        return 1 - torch.exp(-F.softplus(density + self.act_shift) * interval) 
 
     def get_mask(self, rays_o, rays_d, near, far, stepsize, **render_kwargs):
         '''Check whether the rays hit the geometry or not'''
@@ -673,6 +676,7 @@ class TiNeuVox(torch.nn.Module):
             # sample points on rays
             ray_pts, ray_id, step_id, mask_inbbox= self.sample_ray(
                     rays_o=rays_o, rays_d=rays_d, is_train=global_step is not None, **render_kwargs)
+            interval = render_kwargs['stepsize'] * self.voxel_size_ratio
 
             # pts deformation 
             rays_pts_emb = poc_fre(ray_pts, self.pos_poc)
@@ -690,7 +694,9 @@ class TiNeuVox(torch.nn.Module):
             h_feature = self.featurenet(torch.cat((vox_feature_flatten_emb, rays_pts_emb, times_feature), -1))
             density_result = self.densitynet(h_feature)
 
-            alpha = nn.Softplus()(density_result+self.act_shift)
+            # alpha = nn.Softplus()(density_result+self.act_shift)
+            alpha = self.activate_density(density_result,interval)
+
             alpha=alpha.squeeze(-1)
             if self.fast_color_thres > 0:
                 mask = (alpha > self.fast_color_thres)
