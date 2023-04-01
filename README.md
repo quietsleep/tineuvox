@@ -66,7 +66,7 @@ python run.py --config configs/nerf-small/standup.py --render_test --render_only
 
 **For real ones:**  
 ```
-python run.py --config configs/vrig_dataset/chicken.py --render_test --render_only --eval_psnr
+python run.py --config configs/vrig_dataset/chicken.py --render_test --render_only --eval_psnr --eval_lpips_vgg
 ```
 
 To fairly compare with values reported in D-NeRF, `metric.py` is provided to directly evaluate the rendered images with `uint8` values.

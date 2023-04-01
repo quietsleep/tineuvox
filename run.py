@@ -16,8 +16,7 @@ from tqdm import tqdm, trange
 
 from lib import tineuvox, utils
 from lib.load_data import load_data
-from lib.prop_utils import compute_prop_loss, get_proposal_requires_grad_fn
-
+from nerfacc.estimators.prop_net import get_proposal_requires_grad_fn
 
 def config_parser():
     '''Define command line arguments
@@ -445,7 +444,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             raise NotImplementedError
 
         if model.use_occ_grid:
-            model.occ_grid.every_n_step(  # type: ignore
+            model.occ_grid.update_every_n_steps(  # type: ignore
                 step=global_step - 1,
                 occ_eval_fn=lambda x: model.occ_eval_fn(
                     x, render_kwargs["stepsize"] * model.voxel_size
@@ -491,10 +490,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             rgbper_loss = (rgbper * render_result['weights'].detach()).sum() / len(rays_o)
             loss += cfg_train.weight_rgbper * rgbper_loss
         if model.use_prop:
-            prop_loss = compute_prop_loss(
-                render_result["s_vals_per_level"],
-                render_result["weights_per_level"],
-            )
+            prop_loss = model.prop_net.compute_loss(render_result["trans"])
             loss += prop_loss
         loss.backward()
 

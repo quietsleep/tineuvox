@@ -13,8 +13,6 @@ import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 from torch_scatter import segment_coo
 
-from lib.prop_utils import rendering as prop_rendering
-
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 render_utils_cuda = load(
         name='render_utils_cuda',
@@ -29,56 +27,6 @@ total_variation_cuda = load(
             os.path.join(parent_dir, path)
             for path in ['cuda/total_variation.cpp', 'cuda/total_variation_kernel.cu']],
         verbose=True)
-
-def nerfacc_rendering(
-    # ray marching results
-    t_starts: torch.Tensor,
-    t_ends: torch.Tensor,
-    ray_indices: torch.Tensor,
-    n_rays: int,
-    # radiance field
-    rgb_sigma_fn: Optional[Callable] = None,
-    # rendering options
-    render_bkgd: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert rgb_sigma_fn is not None
-
-    rgbs, sigmas = rgb_sigma_fn(t_starts, t_ends, ray_indices)
-    assert rgbs.shape[-1] == 3, "rgbs must have 3 channels, got {}".format(
-        rgbs.shape
-    )
-    assert (
-        sigmas.shape == t_starts.shape
-    ), "sigmas must have shape of (N, 1)! Got {}".format(sigmas.shape)
-    # Rendering: compute weights.
-    weights = nerfacc.vol_rendering.render_weight_from_density(
-        t_starts,
-        t_ends,
-        sigmas,
-        ray_indices=ray_indices,
-        n_rays=n_rays,
-    )
-
-    # Rendering: accumulate rgbs, opacities, and depths along the rays.
-    colors = nerfacc.vol_rendering.accumulate_along_rays(
-        weights, ray_indices, values=rgbs, n_rays=n_rays
-    )
-    opacities = nerfacc.vol_rendering.accumulate_along_rays(
-        weights, ray_indices, values=None, n_rays=n_rays
-    )
-    depths = nerfacc.vol_rendering.accumulate_along_rays(
-        weights,
-        ray_indices,
-        values=(t_starts + t_ends) / 2.0,
-        n_rays=n_rays,
-    )
-
-    # Background composition.
-    if render_bkgd is not None:
-        colors = colors + render_bkgd * (1.0 - opacities)
-
-    return colors, opacities, depths, rgbs, sigmas, weights
-
 
 class Deformation(nn.Module):
     def __init__(self, D=8, W=256, input_ch=27, input_ch_views=3, input_ch_time=9, skips=[],):
@@ -149,8 +97,8 @@ class TiNeuVox(torch.nn.Module):
                  occ_grid_reso=-1, occ_alpha_thres=0.0, occ_thres=0.01, occ_ema_decay=0.95,
                  # for nerfacc propnet
                  voxel_factor_per_prop=None, voxel_dim_factor_per_prop=None, defor_depth_factor_per_prop=None,
-                 net_width_factor_per_prop=None, num_samples_per_prop=None, num_samples=None, 
-                 opaque_bkgd=True, #  opaque_bkgd=False, 
+                 net_width_factor_per_prop=None, prop_samples=None, num_samples=None, 
+                 opaque_bkgd=False, 
                  sampling_type="uniform",
                  **kwargs):
         
@@ -185,7 +133,7 @@ class TiNeuVox(torch.nn.Module):
         self.use_occ_grid = self.occ_grid_reso > 0
         self.occ_grid = None
         if self.use_occ_grid:
-            self.occ_grid = nerfacc.OccupancyGrid(
+            self.occ_grid = nerfacc.OccGridEstimator(
                 roi_aabb=torch.cat([self.xyz_min, self.xyz_max]),
                 resolution=self.occ_grid_reso,
             )
@@ -247,7 +195,7 @@ class TiNeuVox(torch.nn.Module):
         self.voxel_dim_factor_per_prop = voxel_dim_factor_per_prop
         self.defor_depth_factor_per_prop = defor_depth_factor_per_prop
         self.net_width_factor_per_prop = net_width_factor_per_prop
-        self.num_samples_per_prop = num_samples_per_prop
+        self.prop_samples = prop_samples
         self.num_samples = num_samples
         self.opaque_bkgd = opaque_bkgd
         self.sampling_type = sampling_type
@@ -261,7 +209,7 @@ class TiNeuVox(torch.nn.Module):
                 and len(self.voxel_factor_per_prop)
                 == len(self.net_width_factor_per_prop)
                 and len(self.voxel_factor_per_prop)
-                == len(self.num_samples_per_prop)
+                == len(self.prop_samples)
             )
             self.num_voxels_per_prop = [
                 int(self.num_voxels / f) for f in self.voxel_factor_per_prop  # type: ignore
@@ -312,6 +260,7 @@ class TiNeuVox(torch.nn.Module):
                     )
                 ]
             )
+            self.prop_net = nerfacc.PropNetEstimator()
 
     def _set_grid_resolution(self, num_voxels):
         # Determine grid resolution
@@ -351,7 +300,7 @@ class TiNeuVox(torch.nn.Module):
             "voxel_dim_factor_per_prop": self.voxel_dim_factor_per_prop,
             "defor_depth_factor_per_prop": self.defor_depth_factor_per_prop,
             "net_width_factor_per_prop": self.net_width_factor_per_prop,
-            "num_samples_per_prop": self.num_samples_per_prop,
+            "prop_samples": self.prop_samples,
             "num_samples": self.num_samples,
             "opaque_bkgd": self.opaque_bkgd,
             "sampling_type": self.sampling_type,
@@ -470,6 +419,8 @@ class TiNeuVox(torch.nn.Module):
         density_result = self.densitynet(h_feature)
 
         alpha = nn.Softplus()(density_result + self.act_shift) * 25
+        if self.opaque_bkgd:
+            alpha[..., -1, :] = torch.inf
         return alpha
 
     def query_rgb_density(self, ray_pts, viewdirs, times_sel, cam_sel):
@@ -491,6 +442,8 @@ class TiNeuVox(torch.nn.Module):
         density_result = self.densitynet(h_feature)
 
         alpha = nn.Softplus()(density_result + self.act_shift) * 25
+        if self.opaque_bkgd:
+            alpha[..., -1, :] = torch.inf
 
         viewdirs_emb = poc_fre(viewdirs, self.view_poc)
         if self.add_cam == True:
@@ -529,18 +482,21 @@ class TiNeuVox(torch.nn.Module):
 
             def sigma_fn(t_starts, t_ends, ray_indices):
                 if ray_indices.shape[0] == 0:
-                    return torch.zeros((0, 1), device=ray_indices.device)
+                    return torch.zeros((0,), device=ray_indices.device)
                 t_origins = rays_o[ray_indices]
                 t_dirs = rays_d_normed[ray_indices]
                 t_times = times_sel[ray_indices]
-                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
-                return self.query_density(positions, t_times)
+                positions = (
+                    t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
+                )
+                sigmas = self.query_density(positions, t_times)
+                return sigmas.squeeze(-1)
 
             def rgb_sigma_fn(t_starts, t_ends, ray_indices):
                 if ray_indices.shape[0] == 0:
                     return torch.zeros(
                         (0, 3), device=ray_indices.device
-                    ), torch.zeros((0, 1), device=ray_indices.device)
+                    ), torch.zeros((0,), device=ray_indices.device)
                 t_origins = rays_o[ray_indices]
                 t_dirs = rays_d_normed[ray_indices]
                 t_views = viewdirs[ray_indices]
@@ -549,16 +505,17 @@ class TiNeuVox(torch.nn.Module):
                 if self.add_cam:
                     assert cam_sel is not None
                     t_cams = cam_sel[ray_indices]
-                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
-                return self.query_rgb_density(
+                positions = (
+                    t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
+                )
+                rgbs, sigmas = self.query_rgb_density(
                     positions, t_views, t_times, t_cams
                 )
+                return rgbs, sigmas.squeeze(-1)
 
-            ray_indices, t_starts, t_ends = nerfacc.ray_marching(
+            ray_indices, t_starts, t_ends = self.occ_grid.sampling(
                 rays_o,
                 rays_d_normed,
-                scene_aabb=self.occ_grid.roi_aabb,  # type: ignore
-                grid=self.occ_grid,
                 sigma_fn=sigma_fn,
                 near_plane=render_kwargs["near"],
                 far_plane=render_kwargs["far"],
@@ -566,38 +523,24 @@ class TiNeuVox(torch.nn.Module):
                 stratified=self.training,
                 alpha_thre=self.occ_alpha_thres,
             )
-            (
-                rgb_marched,
-                opacity,
-                depth,
-                rgb,
-                alpha,
-                weights,
-            ) = nerfacc_rendering(
+            rgb_marched, opacity, depth, extras = nerfacc.rendering(
                 t_starts,
                 t_ends,
-                ray_indices,
+                ray_indices=ray_indices,
                 n_rays=N,
                 rgb_sigma_fn=rgb_sigma_fn,
                 render_bkgd=render_kwargs["bg"],
             )
+            weights = extras["weights"]
+            rgb = extras["rgbs"]
+            alpha = extras["sigmas"]
 
-            #  occ_perc = self.occ_grid.binary.float().mean().item()
-            #  samples_per_ray = (
-            #      torch.unique(ray_indices, return_counts=True)[1]
-            #      .float()
-            #      .mean()
-            #      .item()
-            #  )
-            #  print(f"occ_perc={occ_perc}, num_samples={samples_per_ray}")
-
-            # TODO(Hang Gao @ 02/27): Figure out what are these.
             ret_dict.update(
                 {
                     "alphainv_last": 1 - opacity[:, 0],  # [N]
-                    "weights": weights[:, 0],  # [S]
+                    "weights": weights,  # [S]
                     "rgb_marched": rgb_marched,  # [N, 3]
-                    "raw_alpha": alpha[:, 0],  # [S]
+                    "raw_alpha": alpha,  # [S]
                     "raw_rgb": rgb,  # [S, 3]
                     "ray_id": ray_indices,  # [S]
                     "depth": depth[:, 0],  # [N]
@@ -624,68 +567,69 @@ class TiNeuVox(torch.nn.Module):
                 t_origins = rays_o[..., None, :]
                 t_dirs = rays_d_normed[..., None, :]
                 t_times = times_sel[..., None, :].repeat_interleave(
-                    t_starts.shape[-2], dim=-2
+                    t_starts.shape[-1], dim=-2
                 )
-                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+                positions = (
+                    t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
+                )
                 return self.props[prop_i](
                     positions.reshape(-1, 3), t_times.reshape(-1, 1)
-                ).reshape(*t_starts.shape[:-1], 1)
+                ).reshape(*t_starts.shape)
 
-            def rgb_sigma_fn(t_starts, t_ends):
+            def rgb_sigma_fn(t_starts, t_ends, _):
                 t_origins = rays_o[..., None, :]
                 t_dirs = rays_d_normed[..., None, :].repeat_interleave(
-                    t_starts.shape[-2], dim=-2
+                    t_starts.shape[-1], dim=-2
                 )
                 t_views = viewdirs[..., None, :].repeat_interleave(
-                    t_starts.shape[-2], dim=-2
+                    t_starts.shape[-1], dim=-2
                 )
                 t_times = times_sel[..., None, :].repeat_interleave(
-                    t_starts.shape[-2], dim=-2
+                    t_starts.shape[-1], dim=-2
                 )
                 t_cams = None
                 if self.add_cam:
                     assert cam_sel is not None
                     t_cams = cam_sel[..., None, :].repeat_interleave(
-                        t_starts.shape[-2], dim=-2
+                        t_starts.shape[-1], dim=-2
                     )
-                positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+                positions = (
+                    t_origins + t_dirs * (t_starts + t_ends)[..., None] / 2.0
+                )
                 rgbs, sigmas = self.query_rgb_density(
                     positions.reshape(-1, 3),
                     t_views.reshape(-1, 3),
                     t_times.reshape(-1, 1),
                     None if not self.add_cam else t_cams.reshape(-1, 1),
                 )
-                rgbs = rgbs.reshape(*t_starts.shape[:-1], 3)
-                sigmas = sigmas.reshape(*t_starts.shape[:-1], 1)
+                rgbs = rgbs.reshape(*t_starts.shape, 3)
+                sigmas = sigmas.reshape(*t_starts.shape)
                 return rgbs, sigmas
 
-            (
-                rgb_marched,
-                opacity,
-                depth,
-                rgb,
-                alpha,
-                weights,
-                (weights_per_level, s_vals_per_level),
-            ) = prop_rendering(
-                rgb_sigma_fn=rgb_sigma_fn,
-                num_samples=self.num_samples,
+            t_starts, t_ends = self.prop_net.sampling(
                 prop_sigma_fns=[
                     lambda *args: prop_sigma_fn(*args, i)
-                    for i in range(len(self.num_samples_per_prop))
+                    for i in range(len(self.prop_samples))
                 ],
-                num_samples_per_prop=self.num_samples_per_prop,
-                rays_o=rays_o,
-                rays_d=rays_d_normed,
-                scene_aabb=None,
+                prop_samples=self.prop_samples,
+                num_samples=self.num_samples,
+                n_rays=N,
                 near_plane=render_kwargs["near"],
                 far_plane=render_kwargs["far"],
-                stratified=self.training,
                 sampling_type=self.sampling_type,
-                opaque_bkgd=self.opaque_bkgd,
-                render_bkgd=render_kwargs["bg"],
-                proposal_requires_grad=prop_requires_grad,
+                stratified=self.training,
+                requires_grad=prop_requires_grad,
             )
+            rgb_marched, opacity, depth, extras = nerfacc.rendering(
+                t_starts,
+                t_ends,
+                rgb_sigma_fn=rgb_sigma_fn,
+                render_bkgd=render_kwargs["bg"],
+            )
+            weights = extras["weights"]
+            rgb = extras["rgbs"]
+            alpha = extras["sigmas"]
+            trans = extras["trans"]
 
             ret_dict.update(
                 {
@@ -702,8 +646,7 @@ class TiNeuVox(torch.nn.Module):
                     .repeat_interleave(self.num_samples, dim=1)
                     .reshape(-1),  # [S]
                     "depth": depth[:, 0],  # [N]
-                    "weights_per_level": weights_per_level,
-                    "s_vals_per_level": s_vals_per_level,
+                    "trans": trans,
                 }
             )
 
