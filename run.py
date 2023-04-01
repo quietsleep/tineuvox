@@ -16,6 +16,7 @@ from tqdm import tqdm, trange
 
 from lib import tineuvox, utils
 from lib.load_data import load_data
+from lib.prop_utils import compute_prop_loss, get_proposal_requires_grad_fn
 
 
 def config_parser():
@@ -52,7 +53,7 @@ def config_parser():
 
 @torch.no_grad()
 def render_viewpoints_hyper(model, data_class, ndc, render_kwargs, test=True, 
-                                all=False, savedir=None, eval_psnr=False):
+                                all=False, savedir=None, eval_psnr=False, eval_lpips_alex=False, eval_lpips_vgg=False):
     
     rgbs = []
     rgbs_gt =[]
@@ -61,6 +62,8 @@ def render_viewpoints_hyper(model, data_class, ndc, render_kwargs, test=True,
     depths = []
     psnrs = []
     ms_ssims =[]
+    lpips_alex = []
+    lpips_vgg = []
 
     if test:
         if all:
@@ -98,6 +101,11 @@ def render_viewpoints_hyper(model, data_class, ndc, render_kwargs, test=True,
             psnrs.append(p)
             rgbs_tensor.append(torch.from_numpy(np.clip(rgb,0,1)).reshape(-1,data_class.h,data_class.w))
             rgbs_gt_tensor.append(torch.from_numpy(np.clip(rgb_gt,0,1)).reshape(-1,data_class.h,data_class.w))
+        if eval_lpips_alex:
+            lpips_alex.append(utils.rgb_lpips(rgb, rgb_gt, net_name = 'alex', device = rays_o.device))
+        if eval_lpips_vgg:
+            lpips_vgg.append(utils.rgb_lpips(rgb, rgb_gt, net_name = 'vgg', device = rays_o.device))
+
         if i==0:
             print('Testing', rgb.shape)
     if eval_psnr:
@@ -107,6 +115,8 @@ def render_viewpoints_hyper(model, data_class, ndc, render_kwargs, test=True,
     if len(psnrs):
         print('Testing psnr', np.mean(psnrs), '(avg)')
         print('Testing ms_ssims', ms_ssims, '(avg)')
+        if eval_lpips_vgg: print('Testing lpips (vgg)', np.mean(lpips_vgg), '(avg)')
+        if eval_lpips_alex: print('Testing lpips (alex)', np.mean(lpips_alex), '(avg)')
 
     if savedir is not None:
         print(f'Writing images to {savedir}')
@@ -388,6 +398,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
     psnr_lst = []
     time0 = time.time()
     global_step = -1
+    proposal_requires_grad_fn = get_proposal_requires_grad_fn()
 
     for global_step in trange(1+start, 1+cfg_train.N_iters):
 
@@ -433,6 +444,16 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
         else:
             raise NotImplementedError
 
+        if model.use_occ_grid:
+            model.occ_grid.every_n_step(  # type: ignore
+                step=global_step - 1,
+                occ_eval_fn=lambda x: model.occ_eval_fn(
+                    x, render_kwargs["stepsize"] * model.voxel_size
+                ),
+                occ_thre=model.occ_thres,
+                ema_decay=model.occ_ema_decay,
+            )
+
         if cfg.data.load2gpu_on_the_fly:
             target = target.to(device)
             rays_o = rays_o.to(device)
@@ -441,7 +462,17 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             times_sel = times_sel.to(device)
 
         # volume rendering
-        render_result = model(rays_o, rays_d, viewdirs, times_sel, global_step=global_step, **render_kwargs)
+        render_result = model(
+            rays_o,
+            rays_d,
+            viewdirs,
+            times_sel,
+            global_step=global_step,
+            prop_requires_grad=proposal_requires_grad_fn(global_step),
+            **render_kwargs,
+        )
+        if render_result["weights"].shape[0] == 0:
+            continue
 
         # gradient descent step
         optimizer.zero_grad(set_to_none = True)
@@ -459,6 +490,12 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
             rgbper = (render_result['raw_rgb'] - target[render_result['ray_id']]).pow(2).sum(-1)
             rgbper_loss = (rgbper * render_result['weights'].detach()).sum() / len(rays_o)
             loss += cfg_train.weight_rgbper * rgbper_loss
+        if model.use_prop:
+            prop_loss = compute_prop_loss(
+                render_result["s_vals_per_level"],
+                render_result["weights_per_level"],
+            )
+            loss += prop_loss
         loss.backward()
 
         if global_step<cfg_train.tv_before and global_step>cfg_train.tv_after and global_step%cfg_train.tv_every==0:
@@ -511,6 +548,7 @@ def scene_rep_reconstruction(args, cfg, cfg_model, cfg_train, xyz_min, xyz_max, 
                 rgbs,disps = render_viewpoints_hyper(
                     data_class=data_class,
                     savedir=testsavedir, all=False, test=True, eval_psnr=args.eval_psnr,
+                    eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                     **render_viewpoints_kwargs)
 
     if global_step != -1:
@@ -534,10 +572,20 @@ def train(args, cfg, data_dict=None):
     cfg.dump(os.path.join(cfg.basedir, cfg.expname, 'config.py'))
 
     # coarse geometry searching
-    if cfg.data.dataset_type == 'hyper_dataset':
-        xyz_min, xyz_max = compute_bbox_by_cam_frustrm_hyper(args = args, cfg = cfg,data_class = data_dict['data_class'])
+    if cfg.data.dataset_type == "hyper_dataset":
+        if data_dict is not None and "aabb" in cfg.data:
+            xyz_min, xyz_max = torch.tensor(cfg.data["aabb"]).reshape(2, 3)
+        else:
+            xyz_min, xyz_max = compute_bbox_by_cam_frustrm_hyper(
+                args=args, cfg=cfg, data_class=data_dict["data_class"]
+            )
     else:
-        xyz_min, xyz_max = compute_bbox_by_cam_frustrm(args = args, cfg = cfg, **data_dict)
+        if data_dict is not None and "aabb" in cfg.data:
+            xyz_min, xyz_max = torch.tensor(cfg.data["aabb"]).reshape(2, 3)
+        else:
+            xyz_min, xyz_max = compute_bbox_by_cam_frustrm(
+                args=args, cfg=cfg, **data_dict
+            )
     coarse_ckpt_path = None
 
     # fine detail reconstruction
@@ -614,6 +662,7 @@ if __name__=='__main__':
                     data_calss=data_dict['data_calss'],
                     savedir=testsavedir, all=True, test=False,
                     eval_psnr=args.eval_psnr,
+                    eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                     **render_viewpoints_kwargs)
         else:
             raise NotImplementedError
@@ -640,6 +689,7 @@ if __name__=='__main__':
                     data_class=data_dict['data_class'],
                     savedir=testsavedir,all=True,test=True,
                     eval_psnr=args.eval_psnr,
+                    eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg,
                     **render_viewpoints_kwargs)
         else:
             raise NotImplementedError

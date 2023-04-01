@@ -7,6 +7,6 @@ imageio
 imageio-ffmpeg
 opencv-python
 pytorch_msssim
-torch
+torch==1.13.1
 torch_scatter
 Pillow

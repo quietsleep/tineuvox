@@ -94,7 +94,15 @@ def load_dnerf_data(basedir, half_res=True, testskip=1):
 
         assert times[0] == 0, "Time must start at 0"
 
-        imgs = (np.array(imgs) / 255.).astype(np.float32)  # keep all 4 channels (RGBA)
+        # NOTE(Hang Gao @ 02/27): The following line is a performance
+        # bottleneck. Switch to GPU conversion.
+        # imgs = (np.array(imgs) / 255.).astype(np.float32)  # keep all 4 channels (RGBA)
+        imgs = (
+            (torch.from_numpy(np.array(imgs)).cuda().float() / 255.0)
+            .cpu()
+            .numpy()
+        )  # keep all 4 channels (RGBA)
+        
         poses = np.array(poses).astype(np.float32)
         times = np.array(times).astype(np.float32)
         counts.append(counts[-1] + imgs.shape[0])
