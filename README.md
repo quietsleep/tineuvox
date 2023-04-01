@@ -49,7 +49,7 @@ For training synthetic scenes such as `standup`, run
 python run.py --config configs/nerf-*/standup.py 
 
 # optionally use nerfacc (occ grid) to speedup
-python run.py --config configs/nerf-*-nerfacc-occgrid/standup.py
+python run.py --config configs/nerf-small-nerfacc-occgrid/standup.py
 ``` 
 Use `small` for TiNeuVox-S and `base` for TiNeuVox-B.
 Use `--render_video` to render a video.
