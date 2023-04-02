@@ -123,6 +123,17 @@ def render_viewpoints_hyper(model, data_class, ndc, render_kwargs, test=True,
             rgb8 = utils.to8b(rgbs[i])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
+        if len(psnrs):
+            with open(os.path.join(savedir, 'psnr.txt'), 'w') as f:
+                f.write('psnr: {:.4f}'.format(np.mean(psnrs)))
+            with open(os.path.join(savedir, 'ms_ssim.txt'), 'w') as f:
+                f.write('ms_ssim: {:.4f}'.format(ms_ssims))
+            if eval_lpips_alex:
+                with open(os.path.join(savedir, 'lpips_alex.txt'), 'w') as f:
+                    f.write('lpips_alex: {:.4f}'.format(np.mean(lpips_alex)))
+            if eval_lpips_vgg:
+                with open(os.path.join(savedir, 'lpips_vgg.txt'), 'w') as f:
+                    f.write('lpips_vgg: {:.4f}'.format(np.mean(lpips_vgg)))
     rgbs = np.array(rgbs)
     depths = np.array(depths)
     return rgbs,depths
@@ -199,6 +210,19 @@ def render_viewpoints(model, render_poses, HW, Ks, ndc, render_kwargs,
             rgb8 = utils.to8b(rgbs[i])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
+
+        if len(psnrs):
+            with open(os.path.join(savedir, 'psnr.txt'), 'w') as f:
+                f.write('psnr: {:.4f}'.format(np.mean(psnrs)))
+            if eval_ssim:
+                with open(os.path.join(savedir, 'ssim.txt'), 'w') as f:
+                    f.write('ssim: {:.4f}'.format(np.mean(ssims)))
+            if eval_lpips_alex:
+                with open(os.path.join(savedir, 'lpips_alex.txt'), 'w') as f:
+                    f.write('lpips_alex: {:.4f}'.format(np.mean(lpips_alex)))
+            if eval_lpips_vgg:
+                with open(os.path.join(savedir, 'lpips_vgg.txt'), 'w') as f:
+                    f.write('lpips_vgg: {:.4f}'.format(np.mean(lpips_vgg)))
 
     rgbs = np.array(rgbs)
     depths = np.array(depths)
@@ -594,6 +618,7 @@ def train(args, cfg, data_dict=None):
     eps_loop = time.time() - eps_time
     eps_time_str = f'{eps_loop//3600:02.0f}:{eps_loop//60%60:02.0f}:{eps_loop%60:02.0f}'
     print('train: finish (eps time', eps_time_str, ')')
+    np.savetxt(f'{cfg.basedir}/{cfg.expname}/training_time.txt', np.asarray([eps_loop]))
 
 if __name__=='__main__':
 
