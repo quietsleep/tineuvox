@@ -11,3 +11,4 @@ torch
 torch_scatter
 Pillow
 nerfacc==0.5.0
+ninja
