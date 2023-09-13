@@ -6,7 +6,7 @@ import time
 from builtins import print
 
 import imageio
-import mmcv
+import mmengine
 import numpy as np
 import torch
 import torch.nn as nn
@@ -625,7 +625,7 @@ if __name__=='__main__':
     # load setup
     parser = config_parser()
     args = parser.parse_args()
-    cfg = mmcv.Config.fromfile(args.config)
+    cfg = mmengine.Config.fromfile(args.config, lazy_import=True)
     # init enviroment
     if torch.cuda.is_available():
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
@@ -688,8 +688,8 @@ if __name__=='__main__':
         else:
             raise NotImplementedError
 
-        imageio.mimwrite(os.path.join(testsavedir, 'train_video.rgb.mp4'), utils.to8b(rgbs), fps = 30, quality = 8)
-        imageio.mimwrite(os.path.join(testsavedir, 'train_video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps = 30, quality = 8)
+        imageio.mimwrite(os.path.join(testsavedir, 'train_video.rgb.mp4'), utils.to8b(rgbs), fps = 30, codec="h264")
+        imageio.mimwrite(os.path.join(testsavedir, 'train_video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps = 30, codec="h264")
 
     # render testset and eval
     if args.render_test:
@@ -715,8 +715,8 @@ if __name__=='__main__':
         else:
             raise NotImplementedError
 
-        imageio.mimwrite(os.path.join(testsavedir, 'test_video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-        imageio.mimwrite(os.path.join(testsavedir, 'test_video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality=8)
+        imageio.mimwrite(os.path.join(testsavedir, 'test_video.rgb.mp4'), utils.to8b(rgbs), fps=30, codec="h264")
+        imageio.mimwrite(os.path.join(testsavedir, 'test_video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, codec="h264")
 
     # render video
     if args.render_video:
@@ -731,8 +731,8 @@ if __name__=='__main__':
                     savedir=testsavedir,
                     test_times=data_dict['render_times'],
                     **render_viewpoints_kwargs)
-            imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, quality =8)
+            imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, codec="h264")
+            imageio.mimwrite(os.path.join(testsavedir, 'video.disp.mp4'), utils.to8b(disps / np.max(disps)), fps=30, codec="h264")
         else:
             raise NotImplementedError
 
