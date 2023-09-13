@@ -2,7 +2,7 @@ numpy
 scipy
 tqdm
 lpips
-mmcv
+mmengine
 imageio
 imageio-ffmpeg
 opencv-python
